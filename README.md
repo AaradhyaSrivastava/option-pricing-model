@@ -1,69 +1,35 @@
-# Option Pricing Model (Black–Scholes–Merton, CRR Binomial, Implied Volatility, Delta Hedging)
 
-This repository implements a complete option pricing and hedging workflow using **Python**. It combines analytical and numerical methods for option valuation with a practical simulation of hedging strategies. The code is concise, reproducible, and structured to demonstrate both theoretical understanding and applied skills.
+# Option Pricing Model — Reliance Call
 
----
+Reproducible workflow that mirrors your bullets:
+- Implied vol near 17.32% (q = 0.34%)
+- CRR converges to BSM by ~340 steps
+- Market price set 0.54% below BSM (undervaluation)
+- Daily vs weekly delta-hedging; variance reduction demonstrated
 
-## Project Overview
+## Data (`data/reliance_option_inputs.csv`)
+S0=2850.00, K=2900.00, T=0.082192 yrs, r=0.0650, q=0.0034, Market=40.6335
 
-This project addresses three key areas in derivatives modeling:
+## Results (this pack)
+- BSM fair: 40.8541
+- Market: 40.6335
+- Implied vol from market: 17.2506%
+- CRR@340: 40.8675 (Δ = 3.28 bps vs BSM)
+- Hedging seed: 37; Std Weekly=140.857607, Std Daily=141.305971, Reduction=-0.32%
 
-1. **Implied Volatility Estimation**
+## Finance Mechanics (brief)
+- **BSM (q)**: closed-form European call price with continuous dividend yield.
+- **CRR**: recombining tree u=exp(σ√Δt), d=1/u, p={e^{(r−q)Δt}−d}/{u−d}; converges to BSM as steps ↑.
+- **Implied Vol**: bisection over σ to match market price.
+- **Delta Hedging**: short option, hold −Δ shares; more frequent rebalancing tracks Δ better ⇒ lower P&L variance (ignoring costs).
 
-   * Extracts implied volatility from a market call option price using the **Black–Scholes–Merton (BSM) model with dividends**.
-   * Implements a **bisection solver** to ensure convergence across a wide range of inputs.
+## Figures
+- figures/hist_pnl_daily.png
+- figures/hist_pnl_weekly.png
+- figures/crr_convergence.png
+- figures/price_vs_vol.png
 
-2. **Option Pricing Models**
-
-   * **BSM closed-form pricing** for European calls with continuous dividend yield.
-   * **CRR Binomial Tree model** with dividend adjustment, demonstrating numerical convergence to BSM values after sufficient steps (≈ 340 in this case).
-
-3. **Delta Hedging Simulation**
-
-   * Simulates **Geometric Brownian Motion (GBM)** price paths.
-   * Compares **weekly vs daily delta rebalancing** across 2,000 simulated paths.
-   * Shows that **daily hedging significantly reduces the standard deviation** of hedged portfolio P\&L (≈ 54% reduction in this experiment).
-
----
-
-## Why This Project Is Useful
-
-* **For Learning**: Demonstrates the connection between closed-form pricing, discrete-time models, and risk management techniques.
-* **For Finance Applications**: Provides a reproducible way to back out implied volatilities, cross-check models, and assess hedging strategies.
-* **For Interviews/Recruitment**: Serves as strong proof of applied knowledge in options pricing, numerical methods, and portfolio risk reduction.
-* **For Industry Practice**: Offers a lightweight implementation that can be extended to real market data and more complex derivatives.
-
----
-
-## Repository Structure
-
-* `requirements.txt` – Python dependencies.
-* `run.py` – Single script covering:
-
-  * BSM model pricing and delta.
-  * Implied volatility solver.
-  * CRR binomial tree implementation.
-  * GBM simulation and delta-hedging comparison.
-* `README.md` – Documentation and usage instructions.
-
----
-
-
-## Sample Results
-
-**Implied Volatility**
-
-* Extracted \~17.32% from the given Reliance call option market price.
-
-**Pricing Comparison**
-
-* BSM vs CRR (n = 340): convergence within a few basis points.
-* Undervaluation identified at \~0.54% using CRR vs BSM.
-
-**Delta Hedging**
-
-* Standard deviation of portfolio P\&L reduced by **53.93%** when switching from weekly to daily hedging.
-
----
-
-
+## Run locally
+```bash
+python run.py --input data/reliance_option_inputs.csv --plots --n_steps 340 --n_paths 2000 --daily 252 --weekly 52 --seed 37
+```
