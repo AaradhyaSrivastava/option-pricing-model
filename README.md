@@ -1,6 +1,6 @@
-# Option Pricing Model — Reliance Call (BSM, CRR, Implied Vol, Delta Hedging)
+x# Option Pricing Model — Reliance Call (BSM, CRR, Implied Vol, Delta Hedging)
 
-This is my self-contained project where I price and hedge a Reliance-like **European call option**.  
+This is my self-contained project where I price and hedge a **Reliance call option**.  
 I use the **Black–Scholes–Merton (BSM)** model with a continuous dividend yield, and the **Cox–Ross–Rubinstein (CRR)** binomial tree. 
 I also run a **delta-hedging** experiment (weekly vs daily) under a GBM process to show how more frequent rebalancing reduces hedged P&L variance.
 
