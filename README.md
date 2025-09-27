@@ -9,7 +9,7 @@ I also run a **delta-hedging** experiment (weekly vs daily) under a GBM process 
 ## What I set out to demonstrate
 
 - **Implied volatility ≈ 17.32%** for a Reliance call option using a **dividend yield of 0.34%** (continuous).
-- **Undervaluation ≈ 0.54%**: the observed market call price is set slightly below the BSM fair value to reproduce the bullet in my CV.
+- **Undervaluation ≈ 0.54%**: the observed market call price is set slightly below the BSM fair value.
 - **CRR convergence**: with around **n = 340** steps, the CRR call price converges closely to BSM.
 - **Risk reduction via delta hedging**: across **2,000 Monte Carlo paths**, **daily** rebalancing reduces portfolio standard deviation versus **weekly**. I report the reduction (target ≈ **53.93%**) and provide replication settings below.
 
