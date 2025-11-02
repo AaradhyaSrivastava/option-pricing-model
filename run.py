@@ -1,192 +1,162 @@
-#!/usr/bin/env python3
-"""
-Option Pricing Model — Reliance Call (BSM, CRR, Implied Vol, Delta Hedging)
-
-Usage:
-  python run.py --input data/reliance_option_inputs.csv --plots --n_steps 340 --n_paths 2000 --daily 252 --weekly 52 --seed 37
-
-Outputs (printed as JSON):
-  - implied_vol, bsm_price, crr_price, crr_diff_bps
-  - hedging std devs & reduction percentage
-
-Figures (when --plots):
-  - figures/hist_pnl_daily.png
-  - figures/hist_pnl_weekly.png
-  - figures/crr_convergence.png
-  - figures/price_vs_vol.png
-"""
-import argparse, json, math, os
+import math
 import numpy as np
-import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 
-# ---------- Core math helpers ----------
-def norm_cdf(x):
-    return 0.5*(1.0 + math.erf(x/math.sqrt(2.0)))
-
-def bsm_call_price(S, K, T, r, q, sigma):
-    # European call with continuous dividend yield q
+# ------------------ Black–Scholes ------------------
+def bsm_call_price(S, K, T, r, sigma, q=0.0):
     if T <= 0 or sigma <= 0:
         return max(0.0, S*math.exp(-q*T) - K*math.exp(-r*T))
-    d1 = (math.log(S/K) + (r - q + 0.5*sigma*sigma)*T)/(sigma*math.sqrt(T))
+    d1 = (math.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*math.sqrt(T))
     d2 = d1 - sigma*math.sqrt(T)
-    return S*math.exp(-q*T)*norm_cdf(d1) - K*math.exp(-r*T)*norm_cdf(d2)
+    return S*math.exp(-q*T)*norm.cdf(d1) - K*math.exp(-r*T)*norm.cdf(d2)
 
-def bsm_call_delta(S, K, T, r, q, sigma):
+def bsm_call_delta(S, K, T, r, sigma, q=0.0):
     if T <= 0 or sigma <= 0:
         return 1.0 if S > K else 0.0
-    d1 = (math.log(S/K) + (r - q + 0.5*sigma*sigma)*T)/(sigma*math.sqrt(T))
-    return math.exp(-q*T)*norm_cdf(d1)
+    d1 = (math.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*math.sqrt(T))
+    return math.exp(-q*T)*norm.cdf(d1)
 
-def implied_vol_bisection(mkt, S, K, T, r, q, lo=1e-6, hi=5.0, tol=1e-8, iters=300):
-    intrinsic = max(0.0, S*math.exp(-q*T) - K*math.exp(-r*T))
-    if mkt <= intrinsic + 1e-12:
-        return 1e-6
-    a, b = lo, hi
-    for _ in range(iters):
-        mid = 0.5*(a+b)
-        price = bsm_call_price(S, K, T, r, q, mid)
-        if abs(price - mkt) < tol:
-            return mid
-        if price > mkt:
-            b = mid
-        else:
-            a = mid
-    return 0.5*(a+b)
+def implied_vol_call_bsm(S, K, T, r, q, market_price):
+    f = lambda sig: bsm_call_price(S, K, T, r, sig, q) - market_price
+    return brentq(f, 1e-6, 3.0)
 
-def crr_call(S, K, T, r, q, sigma, steps):
-    # Cox–Ross–Rubinstein binomial tree (European exercise)
-    if steps < 1:
-        return bsm_call_price(S, K, T, r, q, sigma)
+# ------------------ CRR Binomial ------------------
+def crr_binomial_call(S, K, T, r, sigma, q=0.0, steps=340):
     dt = T/steps
-    u = math.exp(sigma*math.sqrt(dt))
-    d = 1.0/u
-    a = math.exp((r - q)*dt)
-    p = (a - d)/(u - d)
-    p = min(max(p, 0.0), 1.0)  # clip for numerical safety
-
-    # Terminal stock prices and payoffs
-    prices = np.array([S*(u**j)*(d**(steps-j)) for j in range(steps+1)])
-    payoffs = np.maximum(prices - K, 0.0)
-
+    u  = math.exp(sigma*math.sqrt(dt))
+    d  = 1.0/u
+    a  = math.exp((r - q)*dt)
+    p  = (a - d)/(u - d)
+    j = np.arange(steps, -1, -1)
+    ST = S * (u**j) * (d**(steps-j))
+    payoff = np.maximum(ST - K, 0.0)
     disc = math.exp(-r*dt)
-    for _ in range(steps, 0, -1):
-        payoffs = disc*(p*payoffs[1:] + (1.0-p)*payoffs[:-1])
-    return payoffs[0]
+    for _ in range(steps):
+        payoff = disc*(p*payoff[:-1] + (1-p)*payoff[1:])
+    return float(payoff[0])
 
-def simulate_gbm_paths(S0, r, q, sigma, T, n_steps, n_paths, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
-    dt = T / n_steps
-    Z = np.random.normal(size=(n_paths, n_steps))
-    inc = ((r - q) - 0.5*sigma*sigma)*dt + sigma*math.sqrt(dt)*Z
-    paths = np.zeros((n_paths, n_steps+1))
-    paths[:,0] = S0
-    paths[:,1:] = S0*np.exp(np.cumsum(inc, axis=1))
-    return paths
+# ------------------ GBM Simulation ------------------
+@dataclass
+class HedgeResult:
+    mean: float
+    std: float
+    pnl: np.ndarray
 
-def delta_hedge_pnl(paths, K, r, q, sigma, T, rebalance_steps):
-    n_paths, n_cols = paths.shape
-    n_steps_total = n_cols - 1
-    grid = np.linspace(0, n_steps_total, rebalance_steps+1, dtype=int)
-    dt = T / n_steps_total
-    pnl = np.zeros(n_paths)
-    for i in range(n_paths):
-        S_series = paths[i,:]
-        V0 = bsm_call_price(S_series[0], K, T, r, q, sigma)
-        cash = V0
-        stock_pos = 0.0
-        for k in range(len(grid)-1):
-            idx = grid[k]
-            t_rem = max(T - idx*dt, 1e-12)
-            d_now = bsm_call_delta(S_series[idx], K, t_rem, r, q, sigma)
-            d_change = (-d_now) - stock_pos
-            cash -= d_change * S_series[idx]
-            stock_pos += d_change
-            next_idx = grid[k+1]
-            dt_seg = (next_idx - idx)*dt
-            cash *= math.exp(r*dt_seg)
-        ST = S_series[-1]
-        payoff = max(ST - K, 0.0)
-        pnl[i] = cash + stock_pos*ST - payoff
-    return pnl
+def simulate_paths_gbm(S0, mu, sigma, T, n_steps, n_sims, seed=81):
+    rng = np.random.default_rng(seed)
+    dt = T/n_steps
+    Z  = rng.standard_normal((n_sims, n_steps))
+    increments = (mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*Z
+    S = np.empty((n_sims, n_steps+1))
+    S[:,0] = S0
+    S[:,1:] = S0*np.exp(np.cumsum(increments, axis=1))
+    return S
 
-# ---------- CLI ----------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=str, default="data/reliance_option_inputs.csv", help="CSV with S0,K,T_years,r_annual,q_annual,market_call_price")
-    ap.add_argument("--n_steps", type=int, default=340, help="CRR steps")
-    ap.add_argument("--n_paths", type=int, default=2000, help="Number of GBM simulation paths")
-    ap.add_argument("--daily", type=int, default=252, help="Daily-like rebalance steps")
-    ap.add_argument("--weekly", type=int, default=52, help="Weekly-like rebalance steps")
-    ap.add_argument("--plots", action="store_true", help="Generate figures under ./figures")
-    ap.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    ap.add_argument("--out_json", type=str, default=None, help="Optional path to write JSON results")
-    args = ap.parse_args()
+def buyers_hedge_pnl(S_paths, K, r, q, sigma_iv, T, rebalance='daily'):
+    n_sims, n_cols = S_paths.shape
+    dt = T/(n_cols-1)
+    if rebalance == 'weekly':
+        mask = np.zeros(n_cols, dtype=bool); mask[::5] = True; mask[-1] = True
+    else:
+        mask = np.ones(n_cols, dtype=bool)
+    pnls = np.empty(n_sims)
+    for i in range(n_sims):
+        S = S_paths[i]
+        cash = 0.0
+        C0 = bsm_call_price(S[0], K, T, r, sigma_iv, q)
+        delta0 = bsm_call_delta(S[0], K, T, r, sigma_iv, q)
+        shares = -delta0
+        cash  += -C0 + delta0*S[0]
+        for t in range(1, n_cols):
+            cash *= math.exp(r*dt)
+            tau = max(T - t*dt, 0.0)
+            if mask[t]:
+                new_delta = bsm_call_delta(S[t], K, tau, r, sigma_iv, q)
+                d_sh = -new_delta - shares
+                cash += - d_sh * S[t]
+                shares += d_sh
+        payoff = max(S[-1]-K,0.0)
+        cash += shares*S[-1]
+        cash += payoff
+        pnls[i] = cash
+    return HedgeResult(mean=float(pnls.mean()), std=float(pnls.std()), pnl=pnls)
 
-    # Load single-row CSV
-    df = pd.read_csv(args.input)
-    if len(df) != 1:
-        raise ValueError("Expected exactly one instrument row in CSV for this example.")
-    row = df.iloc[0]
-    S0 = float(row["S0"]); K = float(row["K"]); T = float(row["T_years"])
-    r  = float(row["r_annual"]); q = float(row["q_annual"])
-    mkt = float(row["market_call_price"])
+# ------------------ Inputs ------------------
+S0 = 1375.0
+K  = 1400.0
+r_cc = math.log(1+0.058)     # risk-free (continuous)
+q_cc = math.log(1+0.0034)    # dividend yield (continuous)
+T1 = 30/365                  # 1-month contract
 
-    # Implied vol at market price
-    iv = implied_vol_bisection(mkt, S0, K, T, r, q)
+# ===================================================
+# Part 1 — Implied Volatility from market premium
+# ===================================================
+print("\n=== Part 1 — Implied Volatility ===")
+market_price = 18.99   # Reliance option premium
+iv = implied_vol_call_bsm(S0, K, T1, r_cc, q_cc, market_price)
+print(f"Market premium (₹): {market_price:.2f}")
+print(f"Implied Volatility: {iv*100:.2f}%")
 
-    # Prices
-    bsm = bsm_call_price(S0, K, T, r, q, iv)
-    crr = crr_call(S0, K, T, r, q, iv, args.n_steps)
-    diff_bps = (crr - bsm)/bsm * 1e4
+# Plot price vs sigma
+sigmas = np.linspace(0.05, 0.40, 200)
+prices = [bsm_call_price(S0, K, T1, r_cc, s, q_cc) for s in sigmas]
+plt.plot(sigmas, prices, label="BSM Call Price")
+plt.axhline(market_price, color="red", linestyle="--", label="Market Price")
+plt.axvline(iv, color="green", linestyle=":", label=f"IV = {iv*100:.2f}%")
+plt.title("Part 1: Call Price vs Volatility")
+plt.xlabel("Volatility (σ)")
+plt.ylabel("Call Price (₹)")
+plt.legend()
+plt.show()
 
-    # Hedging sims
-    paths = simulate_gbm_paths(S0, r, q, iv, T, n_steps=252, n_paths=args.n_paths, seed=args.seed)
-    pnl_daily = delta_hedge_pnl(paths, K, r, q, iv, T, rebalance_steps=args.daily)
-    pnl_weekly = delta_hedge_pnl(paths, K, r, q, iv, T, rebalance_steps=args.weekly)
-    sd_daily = float(np.std(pnl_daily))
-    sd_weekly = float(np.std(pnl_weekly))
-    reduction = (1 - sd_daily/sd_weekly)*100.0 if sd_weekly > 0 else float("nan")
+# ===================================================
+# Part 2 — BSM vs Binomial pricing
+# ===================================================
+print("\n=== Part 2 — BSM vs Binomial Pricing ===")
+sigma_hist = 0.174   # proxy historical volatility
+bsm_price = bsm_call_price(S0, K, T1, r_cc, sigma_hist, q_cc)
+undervaluation_bsm = (bsm_price - market_price)/market_price*100
+crr_prices = [crr_binomial_call(S0, K, T1, r_cc, sigma_hist, q_cc, steps=n) for n in [150,200,300,340,400,500]]
+steps = [150,200,300,340,400,500]
 
-    out = {
-        "inputs": {"S0": S0, "K": K, "T": T, "r": r, "q": q, "market": mkt},
-        "implied_vol": iv,
-        "bsm_price": bsm,
-        "crr_price": crr,
-        "crr_diff_bps": diff_bps,
-        "hedging": {"std_daily": sd_daily, "std_weekly": sd_weekly, "reduction_pct": reduction}
-    }
-    print(json.dumps(out, indent=2))
+print(f"BSM price (σ={sigma_hist:.3f}): {bsm_price:.2f}  | Undervaluation: {undervaluation_bsm:.2f}%")
+print("CRR prices:", dict(zip(steps, [round(p,2) for p in crr_prices])))
 
-    if args.out_json:
-        with open(args.out_json, "w") as f:
-            json.dump(out, f, indent=2)
+plt.plot(steps, crr_prices, marker="o", label="CRR price")
+plt.axhline(bsm_price, linestyle="--", label="BSM price")
+plt.axhline(market_price, linestyle=":", color="red", label="Market Price")
+plt.title("Part 2: CRR Convergence to BSM")
+plt.xlabel("Steps")
+plt.ylabel("Price (₹)")
+plt.legend()
+plt.show()
 
-    if args.plots:
-        os.makedirs("figures", exist_ok=True)
-        # Histograms
-        plt.figure(); plt.hist(pnl_daily, bins=50)
-        plt.title("Delta-Hedged P&L Distribution (Daily Rebalance)"); plt.xlabel("P&L (INR)"); plt.ylabel("Frequency")
-        plt.savefig("figures/hist_pnl_daily.png", bbox_inches="tight"); plt.close()
+# ===================================================
+# Part 3 — Delta Hedging (Daily vs Weekly)
+# ===================================================
+print("\n=== Part 3 — Delta Hedging Simulation ===")
+T2 = 60/365; n_steps=42; n_sims=2000; mu=0.10
+S_paths = simulate_paths_gbm(S0, mu, iv, T2, n_steps, n_sims, seed=81)
+res_daily  = buyers_hedge_pnl(S_paths, K, r_cc, q_cc, iv, T2, 'daily')
+res_weekly = buyers_hedge_pnl(S_paths, K, r_cc, q_cc, iv, T2, 'weekly')
+reduction = (res_weekly.std - res_daily.std)/res_weekly.std*100
 
-        plt.figure(); plt.hist(pnl_weekly, bins=50)
-        plt.title("Delta-Hedged P&L Distribution (Weekly Rebalance)"); plt.xlabel("P&L (INR)"); plt.ylabel("Frequency")
-        plt.savefig("figures/hist_pnl_weekly.png", bbox_inches="tight"); plt.close()
+print(f"Daily Hedge → mean={res_daily.mean:.2f}, std={res_daily.std:.2f}")
+print(f"Weekly Hedge → mean={res_weekly.mean:.2f}, std={res_weekly.std:.2f}")
+print(f"Std Dev Reduction: {reduction:.2f}%")
 
-        # CRR convergence curve
-        grid = [10, 20, 40, 80, 160, 240, 300, args.n_steps, 400, 600]
-        vals = [crr_call(S0, K, T, r, q, iv, g) for g in grid]
-        plt.figure(); plt.plot(grid, vals, marker="o"); plt.axhline(bsm, linestyle="--")
-        plt.title("CRR Convergence to BSM (Call Price)"); plt.xlabel("Steps (n)"); plt.ylabel("Price (INR)")
-        plt.savefig("figures/crr_convergence.png", bbox_inches="tight"); plt.close()
+plt.hist(res_daily.pnl, bins=50, alpha=0.7)
+plt.title("Part 3: P&L Distribution — Daily Hedge")
+plt.show()
 
-        # Price vs vol
-        sigmas = np.linspace(0.05, 0.40, 200)
-        prices = [bsm_call_price(S0, K, T, r, q, s) for s in sigmas]
-        plt.figure(); plt.plot(sigmas, prices); plt.axhline(mkt, linestyle="--")
-        plt.title("BSM Price vs Volatility with Market Price"); plt.xlabel("Sigma"); plt.ylabel("Price (INR)")
-        plt.savefig("figures/price_vs_vol.png", bbox_inches="tight"); plt.close()
+plt.hist(res_weekly.pnl, bins=50, alpha=0.7)
+plt.title("Part 3: P&L Distribution — Weekly Hedge")
+plt.show()
 
-if __name__ == "__main__":
-    main()
+plt.bar(["Daily","Weekly"], [res_daily.std, res_weekly.std])
+plt.title("Part 3: Std Dev Comparison")
+plt.ylabel("Std Dev (₹)")
+plt.show()
